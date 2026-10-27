@@ -41,7 +41,7 @@ def build_parser():
     parser.add_argument('--settings', type=Path, default=BASE_DIR / 'settings.json')
     parser.add_argument('--output', type=Path, default=BASE_DIR / 'logs')
     parser.add_argument('--csv-interval', type=float, default=1.0)
-    parser.add_argument('--reselect-on-loss', action='store_true',
+    parser.add_argument('--reselect-on-loss', action=argparse.BooleanOptionalAction, default=True,
                         help='Allow fresh shoulder selection after loss; may select a different person')
     parser.add_argument('--motion-window-seconds', type=float, default=2.0)
     parser.add_argument('--shake-min-turns', type=int, default=4)
@@ -55,12 +55,18 @@ def build_parser():
     parser.add_argument('--wave-min-cycles', type=int, default=3)
     parser.add_argument('--wave-min-seconds', type=float, default=1.5)
     parser.add_argument('--seat-baseline-seconds', type=float, default=2.0)
+    parser.add_argument('--seat-iou-threshold', type=float, default=.5,
+                        help='Observed track/reference box IoU below this value means departure')
     parser.add_argument('--seat-departure-ratio', type=float, default=1.0)
     parser.add_argument('--seat-hold-seconds', type=float, default=1.0)
     parser.add_argument('--seat-return-seconds', type=float, default=.7)
+    for name in ('seat_departure_ratio', 'seat_hold_seconds', 'seat_return_seconds'):
+        next(action for action in parser._actions if action.dest == name).help = (
+            'Legacy setting accepted for compatibility; not used by the IoU seat rule'
+        )
     parser.add_argument('--seat-max-gap-seconds', type=float, default=.25)
     parser.add_argument('--seat-roi', nargs=4, type=float, metavar=('LEFT', 'TOP', 'RIGHT', 'BOTTOM'),
-                        help='Optional original-pixel seat anchor region; S also selects it interactively')
+                        help='Initial-generation reference person box in source pixels; full reselection cancels it; S selects it interactively')
     return parser
 
 
@@ -121,6 +127,7 @@ def parse_configuration(argv=None):
             crop_padding=args.crop_padding, max_age_seconds=args.max_age_seconds,
             detection_confidence=args.det_confidence, auto_reset_seconds=args.auto_reset_seconds,
             pose_recovery_seconds=args.pose_recovery_seconds,
+            pose_reselect_seconds=args.pose_reselect_seconds,
             posture_baseline_seconds=args.posture_baseline_seconds,
             posture_head_drop_ratio=args.posture_head_drop_ratio,
             posture_forearm_distance_ratio=args.posture_forearm_distance_ratio,
@@ -138,6 +145,7 @@ def parse_configuration(argv=None):
             head_calibration_seconds=args.head_calibration_seconds,
         )
         seat = SeatConfig(baseline_seconds=args.seat_baseline_seconds,
+                          iou_threshold=args.seat_iou_threshold,
                           departure_ratio=args.seat_departure_ratio, hold_seconds=args.seat_hold_seconds,
                           return_seconds=args.seat_return_seconds, max_gap_seconds=args.seat_max_gap_seconds,
                           confidence=args.landmark_confidence)
@@ -175,6 +183,8 @@ def _draw_panel(canvas, analysis, behavior, path, index, count, frame_index, fps
              (110, 255, 140) if analysis.state == 'locked' else (255, 208, 115))
         if analysis.state == 'lost' and pipeline_config.retain_target_on_loss:
             line('保留原 ID；無法確認新 ID 時按 R 重選', 15, (255, 208, 115))
+        if analysis.state == 'reinitializing':
+            line(preview._reason(analysis.detail), 15, (255, 208, 115))
         line('行為可同時成立；資料不足不視為未發生', 15)
         for name, label in BEHAVIOR_NAMES.items():
             state = behavior.statuses[name] if behavior else 'unknown'
@@ -191,9 +201,17 @@ def _draw_panel(canvas, analysis, behavior, path, index, count, frame_index, fps
                 line(f'{label}：{hz_text} Hz／擺幅 {amp_text} 倍肩寬', 14)
             if analysis.posture:
                 line(f'趴桌持續：{analysis.posture.held_seconds:.1f}／{pipeline_config.posture_hold_seconds:g} 秒', 15)
-            line(f'離席持續：{behavior.seat.held_seconds:.1f} 秒', 15)
+            iou = behavior.seat.iou
+            iou_text = '--' if iou is None else f'{iou:.0%}'
+            threshold = behavior.metrics.get('seat_iou_threshold', .5)
+            line(f'座位框 IoU：{iou_text}／門檻 {threshold:.0%}', 15)
+            if behavior.seat.detail in ('awaiting_return_pose', 'awaiting_box_center_return',
+                                        'baseline_head_shoulders_unavailable'):
+                line(preview._reason(behavior.seat.detail), 14, (255, 208, 115), gap=1)
         line(f'CSV：每 {csv_interval:g} 秒取樣＋事件起訖', 15, (130, 220, 255))
-        line(f'姿態恢復 {analysis.pose_recovery_count} 次／重選 {analysis.auto_reset_count} 次', 14)
+        line(f'姿態不足 {analysis.pose_failure_seconds:.1f}／{pipeline_config.pose_reselect_seconds:g} 秒後重選', 14, gap=1)
+        line(f'每 {pipeline_config.pose_recovery_seconds:g} 秒重建姿態／恢復 {analysis.pose_recovery_count} 次', 14, gap=1)
+        line(f'自動重選 {analysis.auto_reset_count} 次', 14, gap=1)
         draw.rectangle((0, 900, 420, 1080), fill=(22, 25, 31))
         y = 916
         line('空白鍵：暫停／繼續', 17)
@@ -258,7 +276,7 @@ def play_video(path, detector, model_path, pipeline_config, motion_config, seat_
                                          'source_fps': fps, 'detector': detector.provenance,
                                          'environment_record': str(BASE_DIR / 'ENVIRONMENT.json'),
                                          'head_turn_definition': 'Alternating extreme arrivals; first extreme counts as one',
-                                         'seat_definition': 'Observed departure from original seat region; automatic rule horizontal only'})
+                                         'seat_definition': 'Calibrate from continuous observed OC-SORT boxes with valid face/shoulders. After calibration, box/reference IoU below threshold means departure independently of pose. Return needs overlap, center inside and valid pose; full reselection cancels the reference'})
         print('[CSV] ' + str(logger.timeline_path))
         durations, counts = deque(maxlen=30), Counter()
         processed, compute_seconds = 0, 0.0

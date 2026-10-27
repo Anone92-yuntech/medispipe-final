@@ -4,8 +4,10 @@
   "init_seconds": 2.0,
   "min_samples": 10,
   "landmark_confidence": 0.7,
-  "reselect_on_loss": false,
+  "reselect_on_loss": true,
+  "auto_reset_seconds": 0.0,
   "pose_recovery_seconds": 2.0,
+  "pose_reselect_seconds": 10.0,
   "csv_interval": 1.0,
   "motion_window_seconds": 2.0,
   "shake_min_turns": 4,
@@ -23,7 +25,5 @@
   "posture_forearm_distance_ratio": 0.35,
   "posture_hold_seconds": 1.5,
   "seat_baseline_seconds": 2.0,
-  "seat_departure_ratio": 1.0,
-  "seat_hold_seconds": 1.0,
-  "seat_return_seconds": 0.7
+  "seat_iou_threshold": 0.5
 }

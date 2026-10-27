@@ -66,8 +66,9 @@ class PipelineConfig:
     max_age_seconds: float = 1.0
     detection_confidence: float = 0.35
     detector_label: str = ""
-    auto_reset_seconds: float = 0.5
+    auto_reset_seconds: float = 0.0
     pose_recovery_seconds: float = 2.0
+    pose_reselect_seconds: float = 10.0
     posture_baseline_seconds: float = 2.0
     posture_head_drop_ratio: float = 0.30
     posture_forearm_distance_ratio: float = 0.35
@@ -80,6 +81,8 @@ class PipelineConfig:
             raise ValueError("auto_reset_seconds must be finite and nonnegative")
         if not math.isfinite(self.pose_recovery_seconds) or self.pose_recovery_seconds < 0:
             raise ValueError("pose_recovery_seconds must be finite and nonnegative")
+        if not math.isfinite(self.pose_reselect_seconds) or self.pose_reselect_seconds < 0:
+            raise ValueError("pose_reselect_seconds must be finite and nonnegative")
         self.posture_config()  # Validate before creating any model resources.
 
     def posture_config(self):
@@ -170,8 +173,15 @@ class TrackingPipeline:
         self.pose_failure_seconds = 0.0
         self.posture_detector = TableRestDetector(config.posture_config())
 
+    def _reinitialize(self, reason):
+        """Start fresh shoulder selection without resetting OC-SORT or video time."""
+        self.reset_selection()
+        self.auto_reset_count += 1
+        self.last_auto_reset_reason = reason
+        return "reinitializing", reason
+
     def _recover_if_needed(self, state, detail, timestamp_ms, target_observed):
-        """Keep a visible ID; pose-only recovery and track loss use separate clocks."""
+        """Separate track loss, short VIDEO retries and persistent pose failure."""
         if target_observed:
             self._failure_started_ms = None
             if state == "locked":
@@ -182,6 +192,10 @@ class TrackingPipeline:
             if self._pose_failure_started_ms is None:
                 self._pose_failure_started_ms = timestamp_ms
             self.pose_failure_seconds = (timestamp_ms - self._pose_failure_started_ms) / 1000
+            # VIDEO retries do not reset this continuous failure clock. A full
+            # reselection wins when both recovery thresholds expire together.
+            if timestamp_ms - self._pose_failure_started_ms >= self.config.pose_reselect_seconds * 1000:
+                return self._reinitialize("auto_reset_pose_failed")
             retry_from = (self._pose_retry_ms if self._pose_retry_ms is not None
                           else self._pose_failure_started_ms)
             if timestamp_ms - retry_from >= self.config.pose_recovery_seconds * 1000:
@@ -200,11 +214,7 @@ class TrackingPipeline:
             self._failure_started_ms = timestamp_ms
         if timestamp_ms - self._failure_started_ms < self.config.auto_reset_seconds * 1000:
             return state, detail
-        reason = "auto_reset_tracking_lost"
-        self.reset_selection()
-        self.auto_reset_count += 1
-        self.last_auto_reset_reason = reason
-        return "reinitializing", reason
+        return self._reinitialize("auto_reset_tracking_lost")
 
     @staticmethod
     def _mp_image(crop):
@@ -342,6 +352,7 @@ class TrackingPipeline:
             )
             target_id = self.selector.target_id
             if target_id is None:
+                pose = None
                 posture = None
         return FrameAnalysis(tracks, target_id, pose, state, detail,
                              self.selector.statistics(), timestamp_ms,

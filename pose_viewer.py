@@ -54,6 +54,11 @@ REASONS = {
     "auto_reset_tracking_lost": "目標追蹤遺失，重新蒐集肩寬",
     "auto_reset_pose_failed": "骨架持續失敗，重新蒐集肩寬",
     "auto_reset_identity_uncertain": "身分無法確認，重新蒐集肩寬",
+    "collecting_observed_box_baseline": "正在用 OC-SORT 人物框建立座位基準",
+    "baseline_head_shoulders_unavailable": "等待臉部與雙肩有效，重新收集座位基準",
+    "box_iou_below_threshold": "追蹤框與座位框交疊不足，判定離席",
+    "awaiting_return_pose": "追蹤框已返回，等待骨架確認歸席",
+    "awaiting_box_center_return": "等待追蹤框中心回到座位基準框",
     "not_sampled": "尚未取樣", "low_shoulder_confidence": "肩膀信心不足",
     "missing_shoulders": "缺少雙肩", "nonfinite_shoulder_data": "肩膀資料無效",
     "shoulders_outside_person": "肩膀超出人物範圍",
@@ -179,8 +184,11 @@ def _render_sidebar(analysis, video_path, index, count, frame_index,
     line(_reason(analysis.detail), (255, 208, 115), 17)
     line(f"初始化：{config.init_seconds:g} 秒／至少 {config.min_samples} 筆", size=16)
     line(f"信心門檻 {config.landmark_confidence:g}／肩寬差距 {config.min_gap:.0%}", size=16)
-    line(f"追蹤遺失 {config.auto_reset_seconds:g} 秒後重選／共 {analysis.auto_reset_count} 次", size=15)
-    line(f"姿態不足 {analysis.pose_failure_seconds:.1f}／{config.pose_recovery_seconds:g} 秒；恢復 {analysis.pose_recovery_count} 次", size=15)
+    loss_rule = ('保留原 ID' if config.retain_target_on_loss else
+                 f'追蹤遺失 {config.auto_reset_seconds:g} 秒後重選')
+    line(f"{loss_rule}／共 {analysis.auto_reset_count} 次", size=15)
+    line(f"姿態不足 {analysis.pose_failure_seconds:.1f}／{config.pose_reselect_seconds:g} 秒後重選", size=15)
+    line(f"每 {config.pose_recovery_seconds:g} 秒重建姿態／恢復 {analysis.pose_recovery_count} 次", size=15)
     if analysis.auto_reset_reason:
         line(_reason(analysis.auto_reset_reason), (170, 185, 200), 15)
     posture = analysis.posture
@@ -210,7 +218,7 @@ def _render_sidebar(analysis, video_path, index, count, frame_index,
     draw.rectangle((0, 873, panel.width, FHD_HEIGHT), fill=(22, 25, 31))
     y = 890
     line("空白鍵：暫停／繼續", size=18)
-    line("追蹤遺失自動重選／姿態不足保留 ID", size=16)
+    line("短暫姿態不足保留 ID／逾時重新選人", size=16)
     line("R：手動重選　N：下一部", size=16)
     line("Q／Esc／關閉視窗：離開", size=18)
     line("FHD 1920×1080｜不儲存影片｜無音訊", (150, 160, 170), 15)
@@ -436,10 +444,12 @@ def build_parser():
     parser.add_argument('--sample-stride', type=int, default=3)
     parser.add_argument('--crop-padding', type=float, default=.08)
     parser.add_argument('--max-age-seconds', type=float, default=1.0)
-    parser.add_argument('--auto-reset-seconds', type=float, default=.5,
+    parser.add_argument('--auto-reset-seconds', type=float, default=0.0,
                         help='Continuous missing target detection before reselecting (0=immediate)')
     parser.add_argument('--pose-recovery-seconds', type=float, default=2.0,
                         help='Retry target pose after persistent failure; keep ID and baseline (0=immediate)')
+    parser.add_argument('--pose-reselect-seconds', type=float, default=10.0,
+                        help='Continuous pose failure before fresh shoulder selection; VIDEO retries do not restart this clock (0=immediate)')
     parser.add_argument('--posture-baseline-seconds', type=float, default=2.0,
                         help='Reliable upright source time for head-height/shoulder baseline')
     parser.add_argument('--posture-head-drop-ratio', type=float, default=.30,
@@ -476,6 +486,8 @@ def main(argv=None):
         parser.error('--auto-reset-seconds must be finite and nonnegative')
     if not math.isfinite(args.pose_recovery_seconds) or args.pose_recovery_seconds < 0:
         parser.error('--pose-recovery-seconds must be finite and nonnegative')
+    if not math.isfinite(args.pose_reselect_seconds) or args.pose_reselect_seconds < 0:
+        parser.error('--pose-reselect-seconds must be finite and nonnegative')
     if not math.isfinite(args.start_seconds) or args.start_seconds < 0:
         parser.error('--start-seconds must be finite and nonnegative')
     if args.max_frames is not None and args.max_frames < 1:
@@ -498,6 +510,7 @@ def main(argv=None):
             detector_label=f'{detector.provenance["name"]} / {detector.input_size}',
             auto_reset_seconds=args.auto_reset_seconds,
             pose_recovery_seconds=args.pose_recovery_seconds,
+            pose_reselect_seconds=args.pose_reselect_seconds,
             posture_baseline_seconds=args.posture_baseline_seconds,
             posture_head_drop_ratio=args.posture_head_drop_ratio,
             posture_forearm_distance_ratio=args.posture_forearm_distance_ratio,
@@ -505,7 +518,7 @@ def main(argv=None):
             posture_max_gap_seconds=args.posture_max_gap_seconds,
         )
         print(f'Detector: {detector.provenance["name"]} / OpenCV DNN / {detector.device}')
-        print('Preview only. Missing target: auto reselect. Pose failure: keep ID and retry. Table-rest: lowered head near forearm over time. SPACE pause; R manual reset; N next; Q/ESC quit.')
+        print('Preview only. Missing target: reselect. Pose failure: retry VIDEO, then reselect after the continuous timeout. SPACE pause; R manual reset; N next; Q/ESC quit.')
         if not args.headless:
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
             cv2.resizeWindow(WINDOW_NAME, FHD_WIDTH, FHD_HEIGHT)

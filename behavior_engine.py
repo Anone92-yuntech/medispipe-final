@@ -27,7 +27,8 @@ class BehaviorEngine:
 
     def reset(self):
         self.motion.reset()
-        self.seat.reset()
+        self.seat_roi = None
+        self.seat = SeatDetector(self.seat_config)
         self._selection_key = None
         self._pose_recoveries = None
 
@@ -39,7 +40,15 @@ class BehaviorEngine:
         key = (analysis.selection_generation, analysis.target_id)
         if key != self._selection_key:
             self.motion.reset()
-            self.seat.reset()
+            previous = self._selection_key
+            if previous is not None and (previous[0] != key[0]
+                                         or previous[1] is not None):
+                # A full reselection cancels even a user-selected seat box.
+                self.seat_roi = None
+                self.seat = SeatDetector(self.seat_config)
+            else:
+                # Preserve a CLI box while the very first target is acquired.
+                self.seat.reset(clear_roi=False)
             self._selection_key = key
         elif self._pose_recoveries != analysis.pose_recovery_count:
             # A new VIDEO instance may shift estimates; don't interpret its
@@ -55,8 +64,10 @@ class BehaviorEngine:
         pose = analysis.pose if track is not None and analysis.state != 'uncertain' else None
         motion = self.motion.update(pose, analysis.timestamp_ms, scale=scale,
                                     bbox=track.bbox if track is not None else None)
+        # Box-based departure remains independent of MediaPipe validity or a
+        # pose-anchor rejection. A rejected pose still cannot confirm return.
         seat = self.seat.update(pose, track, analysis.timestamp_ms,
-                                baseline_scale=scale, frame_shape=frame_shape)
+                                frame_shape=frame_shape)
         statuses = {'head_shake': motion.head_state,
                     'left_wave': motion.left_state, 'right_wave': motion.right_state}
         if motion.left_state == motion.right_state == 'active':
@@ -78,8 +89,12 @@ class BehaviorEngine:
                    'seat_leave': seat.detail}
         metrics = dict(motion.metrics)
         metrics.update({'head_turn_count': motion.turn_count,
+                        'seat_iou_threshold': self.seat_config.iou_threshold,
                         'posture': asdict(posture) if posture else None,
                         'seat': asdict(seat), 'tracking_state': analysis.state,
                         'tracking_detail': analysis.detail,
+                        'auto_reset_count': analysis.auto_reset_count,
+                        'auto_reset_reason': analysis.auto_reset_reason,
+                        'pose_failure_seconds': analysis.pose_failure_seconds,
                         'pose_recovery_count': analysis.pose_recovery_count})
         return BehaviorFrame(statuses, details, metrics, motion, seat)
