@@ -124,26 +124,116 @@ class AppConfigurationTests(unittest.TestCase):
             self.parse(*arguments)
         self.assertEqual(raised.exception.code, 2)
 
-    def test_default_head_definition_and_target_retention(self):
+    def test_default_head_definition_and_three_recovery_levels(self):
         args, pipeline, motion, seat = self.parse()
         self.assertEqual(motion.shake_min_turns, 4)
         self.assertEqual(motion.window_seconds, 2.0)
-        self.assertTrue(pipeline.retain_target_on_loss)
+        self.assertFalse(pipeline.retain_target_on_loss)
+        self.assertTrue(args.reselect_on_loss)
+        self.assertEqual(pipeline.auto_reset_seconds, 0.0)
+        self.assertEqual(pipeline.pose_recovery_seconds, 2.0)
+        self.assertEqual(pipeline.pose_reselect_seconds, 10.0)
         self.assertEqual(args.csv_interval, 1.0)
-        self.assertEqual(seat.departure_ratio, 1.0)
+        self.assertEqual(seat.iou_threshold, .5)
 
     def test_settings_then_cli_precedence_and_path_conversion(self):
         self.write_settings({'shake_min_turns': 5, 'wave_min_hz': 3,
-                             'seat_hold_seconds': 2, 'output': str(Path(self.temp.name) / '記錄'),
+                             'seat_iou_threshold': .7, 'output': str(Path(self.temp.name) / '記錄'),
                              'reselect_on_loss': False, 'seat_roi': [100, 120, 400, 500]})
         args, pipeline, motion, seat = self.parse('--shake-min-turns', '6', '--wave-min-hz', '2.5',
-                                                  '--reselect-on-loss', '--seat-hold-seconds', '1.2')
+                                                  '--reselect-on-loss', '--seat-iou-threshold', '.6')
         self.assertEqual(motion.shake_min_turns, 6)
         self.assertEqual(motion.wave_min_hz, 2.5)
-        self.assertEqual(seat.hold_seconds, 1.2)
+        self.assertEqual(seat.iou_threshold, .6)
         self.assertIsInstance(args.output, Path)
         self.assertEqual(args.seat_roi, [100.0, 120.0, 400.0, 500.0])
         self.assertFalse(pipeline.retain_target_on_loss)
+
+    def test_seat_iou_settings_are_forwarded_and_upper_boundary_is_supported(self):
+        self.write_settings({'seat_iou_threshold': .72})
+        args, _, _, seat = self.parse()
+        self.assertEqual(args.seat_iou_threshold, .72)
+        self.assertEqual(seat.iou_threshold, .72)
+        args, _, _, seat = self.parse('--seat-iou-threshold', '1')
+        self.assertEqual(args.seat_iou_threshold, 1)
+        self.assertEqual(seat.iou_threshold, 1)
+
+    def test_invalid_seat_iou_cli_and_settings_are_rejected(self):
+        for value in ('0', '-.1', '1.001', 'nan', 'inf', '-inf'):
+            with self.subTest(source='cli', value=value):
+                self.write_settings({})
+                self.assert_invalid(f'--seat-iou-threshold={value}')
+            with self.subTest(source='settings', value=value):
+                self.write_settings({'seat_iou_threshold': value})
+                self.assert_invalid()
+
+    def test_legacy_seat_options_are_accepted_without_replacing_iou_threshold(self):
+        self.write_settings({'seat_iou_threshold': .65})
+        _, _, _, seat = self.parse('--seat-departure-ratio', '1.4',
+                                   '--seat-hold-seconds', '2', '--seat-return-seconds', '.9')
+        self.assertEqual(seat.iou_threshold, .65)
+
+    def test_settings_recovery_timeouts_are_forwarded_to_pipeline(self):
+        self.write_settings({'reselect_on_loss': False, 'auto_reset_seconds': .8,
+                             'pose_recovery_seconds': 3.5, 'pose_reselect_seconds': 18})
+        args, pipeline, _, _ = self.parse()
+        self.assertFalse(args.reselect_on_loss)
+        self.assertTrue(pipeline.retain_target_on_loss)
+        self.assertEqual(pipeline.auto_reset_seconds, .8)
+        self.assertEqual(pipeline.pose_recovery_seconds, 3.5)
+        # Retaining a lost tracking ID does not disable the independent pose timeout.
+        self.assertEqual(pipeline.pose_reselect_seconds, 18.0)
+
+    def test_cli_recovery_timeouts_override_settings_independently(self):
+        self.write_settings({'auto_reset_seconds': .8, 'pose_recovery_seconds': 3.5,
+                             'pose_reselect_seconds': 18})
+        args, pipeline, _, _ = self.parse('--auto-reset-seconds', '.4',
+                                          '--pose-recovery-seconds', '1.5',
+                                          '--pose-reselect-seconds', '12')
+        self.assertEqual(pipeline.auto_reset_seconds, .4)
+        self.assertEqual(pipeline.pose_recovery_seconds, 1.5)
+        self.assertEqual(pipeline.pose_reselect_seconds, 12.0)
+        self.assertEqual(args.pose_reselect_seconds, 12.0)
+
+    def test_no_reselect_on_loss_overrides_enabled_settings_without_disabling_pose_timeout(self):
+        self.write_settings({'reselect_on_loss': True, 'pose_reselect_seconds': 15})
+        args, pipeline, _, _ = self.parse('--no-reselect-on-loss')
+        self.assertFalse(args.reselect_on_loss)
+        self.assertTrue(pipeline.retain_target_on_loss)
+        self.assertEqual(pipeline.pose_reselect_seconds, 15.0)
+
+    def test_last_boolean_cli_choice_wins(self):
+        args, pipeline, _, _ = self.parse('--no-reselect-on-loss', '--reselect-on-loss')
+        self.assertTrue(args.reselect_on_loss)
+        self.assertFalse(pipeline.retain_target_on_loss)
+        args, pipeline, _, _ = self.parse('--reselect-on-loss', '--no-reselect-on-loss')
+        self.assertFalse(args.reselect_on_loss)
+        self.assertTrue(pipeline.retain_target_on_loss)
+
+    def test_zero_recovery_timeouts_are_explicitly_supported(self):
+        _, pipeline, _, _ = self.parse('--auto-reset-seconds', '0',
+                                       '--pose-recovery-seconds', '0',
+                                       '--pose-reselect-seconds', '0')
+        self.assertEqual(pipeline.auto_reset_seconds, 0)
+        self.assertEqual(pipeline.pose_recovery_seconds, 0)
+        self.assertEqual(pipeline.pose_reselect_seconds, 0)
+
+    def test_invalid_recovery_timeouts_rejected_before_loading_models(self):
+        with patch.object(experiment, 'ensure_model') as pose_loader, \
+             patch.object(experiment, 'PersonDetector') as detector_loader:
+            for option in ('--auto-reset-seconds', '--pose-recovery-seconds',
+                           '--pose-reselect-seconds'):
+                for value in ('-1', 'nan', 'inf', '-inf'):
+                    with self.subTest(option=option, value=value):
+                        self.assert_invalid(f'{option}={value}')
+            pose_loader.assert_not_called()
+            detector_loader.assert_not_called()
+
+    def test_invalid_pose_timeout_in_settings_is_rejected(self):
+        for value in (-1, 'nan', 'inf', '-inf', 'not-a-number'):
+            with self.subTest(value=value):
+                self.write_settings({'pose_reselect_seconds': value})
+                self.assert_invalid()
 
     def test_bad_configuration_is_rejected_before_loading_models(self):
         for args in (('--csv-interval', '0'), ('--csv-interval', '0.0001'),
@@ -151,7 +241,7 @@ class AppConfigurationTests(unittest.TestCase):
                      ('--max-frames', '0'), ('--sample-stride', '0'),
                      ('--min-samples', '1'), ('--landmark-confidence', '1.1'),
                      ('--wave-min-amplitude', '.5'), ('--shake-min-turns', '1'),
-                     ('--seat-hold-seconds', '-1'), ('--seat-departure-ratio', 'inf'),
+                     ('--seat-iou-threshold', '0'), ('--seat-iou-threshold', '1.01'),
                      ('--seat-roi', '100', '50', '90', '200')):
             with self.subTest(args=args):
                 self.assert_invalid(*args)

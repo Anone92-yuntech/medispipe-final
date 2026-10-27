@@ -151,7 +151,8 @@ class PipelineIntegrationTests(unittest.TestCase):
         self.pipeline = TrackingPipeline(
             self.detector, model, fps=10,
             config=PipelineConfig(init_seconds=2, min_samples=10,
-                                  sample_stride=1, stable_observations=3),
+                                  sample_stride=1, stable_observations=3,
+                                  auto_reset_seconds=0.5),
         )
         self.frame = np.zeros((400, 800, 3), dtype=np.uint8)
         self.index = 0
@@ -203,6 +204,15 @@ class PipelineIntegrationTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     PipelineConfig(pose_recovery_seconds=value)
         self.assertEqual(PipelineConfig(pose_recovery_seconds=0).pose_recovery_seconds, 0)
+
+    def test_pose_reselection_timeout_is_independent_and_validated(self):
+        self.assertEqual(PipelineConfig().pose_reselect_seconds, 10.0)
+        self.assertEqual(PipelineConfig().auto_reset_seconds, 0)
+        for value in (-1, float("nan"), float("inf"), -float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    PipelineConfig(pose_reselect_seconds=value)
+        self.assertEqual(PipelineConfig(pose_reselect_seconds=0).pose_reselect_seconds, 0)
 
     def test_black_prefix_advances_real_tracker_without_pose_or_false_lock(self):
         self.assertIsInstance(self.pipeline.tracker.tracker, OCSort)
@@ -431,6 +441,174 @@ class PipelineIntegrationTests(unittest.TestCase):
             self.assertIsNotNone(result.pose)
         self.assertEqual(self.pipeline.auto_reset_count, 0)
         self.assertEqual(self.pipeline.pose_recovery_count, 0)
+
+    def test_two_second_pose_retries_do_not_extend_ten_second_reselection_deadline(self):
+        first = self.calibrate_posture()
+        generation = self.pipeline.selection_generation
+        tracker = self.pipeline.tracker
+        old_selector = self.pipeline.selector
+        old_posture = self.pipeline.posture_detector
+        image_calls = sum(len(instance.calls) for instance in self.factory.image_instances())
+        self.factory.video_no_pose = True
+        first_failure = self.step()
+        # Retries at 2, 4, 6 and 8 seconds must retain the original deadline.
+        for _ in range(99):
+            result = self.step()
+            self.assertEqual(result.target_id, first.target_id)
+            self.assertEqual(result.state, "pose_uncertain")
+            self.assertEqual(self.pipeline.auto_reset_count, 0)
+        self.assertEqual(self.pipeline.pose_recovery_count, 4)
+        self.timestamp = first_failure.timestamp_ms + 9999
+        result = self.step()
+        self.assertEqual(result.target_id, first.target_id)
+        self.assertAlmostEqual(result.pose_failure_seconds, 9.999)
+        self.assertEqual(self.pipeline.selection_generation, generation)
+        self.timestamp = first_failure.timestamp_ms + 10000
+        reset = self.step()
+        self.assertEqual(reset.state, "reinitializing")
+        self.assertEqual(reset.detail, "auto_reset_pose_failed")
+        self.assertEqual(reset.auto_reset_reason, "auto_reset_pose_failed")
+        self.assertEqual(reset.auto_reset_count, 1)
+        self.assertIsNone(reset.target_id)
+        self.assertIsNone(reset.pose)
+        self.assertIsNone(reset.posture)
+        self.assertEqual(reset.statistics, {})
+        self.assertEqual(self.pipeline.selection_generation, generation + 1)
+        self.assertIs(self.pipeline.tracker, tracker)
+        self.assertIsNot(self.pipeline.selector, old_selector)
+        self.assertIsNot(self.pipeline.posture_detector, old_posture)
+        self.assertFalse(self.pipeline.posture_detector.baseline_ready)
+        self.assertEqual(self.pipeline.pose_recovery_count, 4)  # Full reset takes priority.
+        self.assertTrue(all(instance.closed for instance in self.factory.video_instances()))
+        self.assertEqual(sum(len(instance.calls) for instance in self.factory.image_instances()),
+                         image_calls)  # New IMAGE evidence starts on the following frame.
+        self.assertEqual(self.detector.calls, tracker.frame_count)
+        self.assertTrue(next(track for track in reset.tracks
+                             if track.track_id == first.target_id).observed)
+
+        self.factory.video_no_pose = False
+        first_fresh = self.step()
+        self.assertIsNone(first_fresh.target_id)
+        self.assertEqual(sum(len(instance.calls) for instance in self.factory.image_instances()),
+                         image_calls + 2)  # Re-evaluate both currently observed IDs.
+        self.assertEqual(len(first_fresh.statistics), 2)
+        self.assertTrue(all(data["sample_count"] == 1
+                            for data in first_fresh.statistics.values()))
+        for _ in range(19):
+            result = self.step()
+            self.assertIsNone(result.target_id)
+        second = self.lock()
+        self.assertGreaterEqual(second.timestamp_ms - first_fresh.timestamp_ms, 2000)
+        self.assertEqual(second.target_id, first.target_id)  # Same ID, new evidence generation.
+        self.assertEqual(second.selection_generation, generation + 1)
+        self.assertEqual(second.pose_failure_seconds, 0)
+        self.assertEqual(self.pipeline.auto_reset_count, 1)
+        self.assertIsNone(second.posture.baseline_head_y)
+        self.assertEqual(self.detector.calls, tracker.frame_count)
+
+    def test_healthy_pose_restarts_full_reselection_clock(self):
+        first = self.lock()
+        self.factory.video_no_pose = True
+        first_failure = self.step()
+        for _ in range(99):
+            result = self.step()
+        self.assertEqual(result.target_id, first.target_id)
+        self.assertEqual(result.pose_failure_seconds, 9.9)
+        self.factory.video_no_pose = False
+        healthy = self.step()
+        self.assertEqual(healthy.state, "locked")
+        self.assertEqual(healthy.pose_failure_seconds, 0)
+        self.factory.video_no_pose = True
+        second_failure = self.step()
+        self.assertEqual(second_failure.pose_failure_seconds, 0)
+        for _ in range(99):
+            self.step()
+        self.timestamp = second_failure.timestamp_ms + 9999
+        result = self.step()
+        self.assertEqual(result.target_id, first.target_id)
+        self.assertEqual(self.pipeline.auto_reset_count, 0)
+        self.timestamp = second_failure.timestamp_ms + 10000
+        result = self.step()
+        self.assertEqual(result.state, "reinitializing")
+        self.assertEqual(result.detail, "auto_reset_pose_failed")
+
+    def test_pose_timeout_still_reselects_when_tracking_loss_retention_is_enabled(self):
+        self.pipeline.config = replace(self.pipeline.config, retain_target_on_loss=True,
+                                       pose_reselect_seconds=0.3)
+        self.lock()
+        self.factory.video_no_pose = True
+        first_failure = self.step()
+        for _ in range(2):
+            result = self.step()
+            self.assertIsNotNone(result.target_id)
+        result = self.step()
+        self.assertEqual(result.timestamp_ms - first_failure.timestamp_ms, 300)
+        self.assertEqual(result.state, "reinitializing")
+        self.assertEqual(result.detail, "auto_reset_pose_failed")
+        self.assertIsNone(result.target_id)
+        self.assertEqual(self.pipeline.pose_recovery_count, 0)
+
+    def test_retained_tracking_loss_clears_pose_timeout_before_observed_failure_restarts(self):
+        self.pipeline.config = replace(self.pipeline.config, retain_target_on_loss=True)
+        first = self.lock()
+        self.factory.video_no_pose = True
+        self.step()
+        for _ in range(99):
+            self.step()
+        self.detector.detections = np.array([ADULT], dtype=float)
+        lost = self.step()
+        self.assertEqual(lost.state, "lost")
+        self.assertEqual(lost.target_id, first.target_id)
+        self.assertEqual(lost.pose_failure_seconds, 0)
+        self.detector.detections = np.array([CHILD, ADULT], dtype=float)
+        resumed = self.step()
+        self.assertEqual(resumed.state, "pose_uncertain")
+        self.assertEqual(resumed.target_id, first.target_id)
+        self.assertEqual(resumed.pose_failure_seconds, 0)
+        for _ in range(99):
+            self.step()
+        self.timestamp = resumed.timestamp_ms + 9999
+        result = self.step()
+        self.assertEqual(result.target_id, first.target_id)
+        self.assertEqual(self.pipeline.auto_reset_count, 0)
+
+    def test_no_people_after_pose_timeout_waits_without_repeated_resets(self):
+        self.pipeline.config = replace(self.pipeline.config, pose_reselect_seconds=0.2)
+        self.lock()
+        self.factory.video_no_pose = True
+        self.step()
+        self.step()
+        reset = self.step()
+        self.assertEqual(reset.state, "reinitializing")
+        generation = reset.selection_generation
+        self.detector.detections = np.empty((0, 5), dtype=float)
+        self.factory.no_pose = True
+        for _ in range(120):
+            result = self.step()
+            self.assertEqual(result.state, "waiting")
+            self.assertIsNone(result.target_id)
+            self.assertIsNone(result.pose)
+        self.assertEqual(self.pipeline.auto_reset_count, 1)
+        self.assertEqual(self.pipeline.selection_generation, generation)
+        self.assertEqual(self.detector.calls, self.pipeline.tracker.frame_count)
+
+    def test_zero_pose_reselection_timeout_resets_before_video_retry(self):
+        self.pipeline.config = replace(self.pipeline.config, pose_reselect_seconds=0,
+                                       pose_recovery_seconds=0)
+        self.lock()
+        frames_before = self.pipeline.tracker.frame_count
+        image_calls = sum(len(instance.calls) for instance in self.factory.image_instances())
+        self.factory.video_no_pose = True
+        result = self.step()
+        self.assertEqual(result.state, "reinitializing")
+        self.assertEqual(result.detail, "auto_reset_pose_failed")
+        self.assertIsNone(result.target_id)
+        self.assertEqual(result.statistics, {})
+        self.assertEqual(self.pipeline.auto_reset_count, 1)
+        self.assertEqual(self.pipeline.pose_recovery_count, 0)
+        self.assertEqual(self.pipeline.tracker.frame_count, frames_before + 1)
+        self.assertEqual(sum(len(instance.calls) for instance in self.factory.image_instances()),
+                         image_calls)
 
     def test_invalid_video_shoulders_refresh_pose_without_reselecting(self):
         first = self.lock()
@@ -730,6 +908,9 @@ class PipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(self.pipeline.tracker.frame_count, tracker_frames)
         self.assertEqual(self.pipeline.selection_generation, old_generation + 1)
         self.assertEqual(self.pipeline.auto_reset_count, 0)
+        self.assertEqual(self.pipeline.pose_failure_seconds, 0)
+        self.assertIsNone(self.pipeline._pose_failure_started_ms)
+        self.assertIsNone(self.pipeline._pose_retry_ms)
         with self.assertRaises(ValueError):
             self.pipeline.process(self.frame, first.timestamp_ms, self.index)
         result = self.step()
